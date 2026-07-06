@@ -3,6 +3,8 @@ const router = express.Router();
 const Contract = require('../models/Contract');
 const House = require('../models/House');
 const Appointment = require('../models/Appointment');
+const FinanceRecord = require('../models/FinanceRecord');
+const IncomeUpdateLog = require('../models/IncomeUpdateLog');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Shared query logic
@@ -187,6 +189,78 @@ router.get('/:id', authenticate, async (req, res, next) => {
     }
 
     res.json(contract);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/contracts/:id - Update contract (e.g. rent, deposit)
+router.put('/:id', authenticate, authorize('landlord'), async (req, res, next) => {
+  try {
+    const contract = await Contract.findById(req.params.id);
+    if (!contract) {
+      return res.status(404).json({ message: '合同不存在' });
+    }
+    if (contract.landlordId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: '无权修改此合同' });
+    }
+
+    const { rent, deposit, startDate, endDate } = req.body;
+    const oldRent = contract.rent;
+    const changes = {};
+
+    if (rent !== undefined && rent !== contract.rent) {
+      changes.rent = rent;
+    }
+    if (deposit !== undefined && deposit !== contract.deposit) {
+      changes.deposit = deposit;
+    }
+    if (startDate) changes.startDate = startDate;
+    if (endDate) changes.endDate = endDate;
+
+    if (Object.keys(changes).length === 0) {
+      return res.status(400).json({ message: '没有需要更新的字段' });
+    }
+
+    // Update contract fields
+    Object.assign(contract, changes);
+    await contract.save();
+
+    // Auto-update related FinanceRecords if rent changed
+    if (changes.rent !== undefined) {
+      const relatedRecords = await FinanceRecord.find({
+        contractId: contract._id,
+      });
+
+      const updateLogs = [];
+      for (const record of relatedRecords) {
+        const oldAmount = record.amount;
+        record.amount = changes.rent;
+        await record.save();
+
+        updateLogs.push({
+          contractId: contract._id,
+          landlordId: contract.landlordId,
+          houseId: contract.houseId,
+          month: record.month,
+          oldAmount,
+          newAmount: changes.rent,
+          operatorId: req.user._id,
+        });
+      }
+
+      // Batch create update logs
+      if (updateLogs.length > 0) {
+        await IncomeUpdateLog.insertMany(updateLogs);
+      }
+    }
+
+    const populated = await Contract.findById(contract._id)
+      .populate('tenantId', 'name phone')
+      .populate('landlordId', 'name phone')
+      .populate('houseId', 'title address');
+
+    res.json(populated);
   } catch (err) {
     next(err);
   }
