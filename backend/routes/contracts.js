@@ -4,7 +4,6 @@ const Contract = require('../models/Contract');
 const House = require('../models/House');
 const Appointment = require('../models/Appointment');
 const FinanceRecord = require('../models/FinanceRecord');
-const IncomeUpdateLog = require('../models/IncomeUpdateLog');
 const { authenticate, authorize } = require('../middleware/auth');
 
 // Shared query logic
@@ -92,12 +91,38 @@ router.post('/', authenticate, authorize('landlord'), async (req, res, next) => 
       return res.status(400).json({ message: '请填写必填字段' });
     }
 
+    // 开始时间不能早于今天
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (new Date(startDate) < today) {
+      return res.status(400).json({ message: '合同开始时间不能早于今天' });
+    }
+
+    // 结束时间不能早于开始时间
+    if (new Date(endDate) < new Date(startDate)) {
+      return res.status(400).json({ message: '合同结束时间不能早于开始时间' });
+    }
+
     const house = await House.findById(houseId);
     if (!house) {
       return res.status(404).json({ message: '房源不存在' });
     }
     if (house.landlordId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: '无权为此房源创建合同' });
+    }
+    if (house.status === 'offline') {
+      return res.status(400).json({ message: '该房源已锁定下架，无法创建新合同' });
+    }
+
+    // Check for overlapping signed contracts
+    const conflict = await Contract.findOne({
+      houseId,
+      status: 'signed',
+      startDate: { $lte: new Date(endDate) },
+      endDate: { $gte: new Date(startDate) },
+    });
+    if (conflict) {
+      return res.status(400).json({ message: '该房源在所选时间段内已有有效合同，时间冲突' });
     }
 
     const contract = new Contract({
@@ -143,7 +168,34 @@ router.post('/from-appointment/:appointmentId', authenticate, authorize('landlor
       return res.status(400).json({ message: '请填写必填字段' });
     }
 
+    // 开始时间不能早于今天
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (new Date(startDate) < today) {
+      return res.status(400).json({ message: '合同开始时间不能早于今天' });
+    }
+
+    // 结束时间不能早于开始时间
+    if (new Date(endDate) < new Date(startDate)) {
+      return res.status(400).json({ message: '合同结束时间不能早于开始时间' });
+    }
+
     const house = appointment.houseId;
+    if (house.status === 'offline') {
+      return res.status(400).json({ message: '该房源已锁定下架，无法创建新合同' });
+    }
+
+    // Check for overlapping signed contracts
+    const conflict = await Contract.findOne({
+      houseId: house._id || house,
+      status: 'signed',
+      startDate: { $lte: new Date(endDate) },
+      endDate: { $gte: new Date(startDate) },
+    });
+    if (conflict) {
+      return res.status(400).json({ message: '该房源在所选时间段内已有有效合同，时间冲突' });
+    }
+
     const contract = new Contract({
       tenantId: appointment.tenantId,
       landlordId: req.user._id,
@@ -204,6 +256,9 @@ router.put('/:id', authenticate, authorize('landlord'), async (req, res, next) =
     if (contract.landlordId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: '无权修改此合同' });
     }
+    if (contract.signedByTenant || contract.signedByLandlord) {
+      return res.status(400).json({ message: '合同已有签署记录，无法修改' });
+    }
 
     const { rent, deposit, startDate, endDate } = req.body;
     const oldRent = contract.rent;
@@ -217,6 +272,20 @@ router.put('/:id', authenticate, authorize('landlord'), async (req, res, next) =
     }
     if (startDate) changes.startDate = startDate;
     if (endDate) changes.endDate = endDate;
+
+    // 验证日期：开始时间不能早于今天
+    const effectiveStartDate = changes.startDate || contract.startDate;
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    if (changes.startDate && new Date(changes.startDate) < today) {
+      return res.status(400).json({ message: '合同开始时间不能早于今天' });
+    }
+
+    // 验证日期：结束时间不能早于开始时间
+    const effectiveEndDate = changes.endDate || contract.endDate;
+    if (new Date(effectiveEndDate) < new Date(effectiveStartDate)) {
+      return res.status(400).json({ message: '合同结束时间不能早于开始时间' });
+    }
 
     if (Object.keys(changes).length === 0) {
       return res.status(400).json({ message: '没有需要更新的字段' });
@@ -232,26 +301,11 @@ router.put('/:id', authenticate, authorize('landlord'), async (req, res, next) =
         contractId: contract._id,
       });
 
-      const updateLogs = [];
-      for (const record of relatedRecords) {
-        const oldAmount = record.amount;
-        record.amount = changes.rent;
-        await record.save();
-
-        updateLogs.push({
-          contractId: contract._id,
-          landlordId: contract.landlordId,
-          houseId: contract.houseId,
-          month: record.month,
-          oldAmount,
-          newAmount: changes.rent,
-          operatorId: req.user._id,
-        });
-      }
-
-      // Batch create update logs
-      if (updateLogs.length > 0) {
-        await IncomeUpdateLog.insertMany(updateLogs);
+      if (relatedRecords.length > 0) {
+        for (const record of relatedRecords) {
+          record.amount = changes.rent;
+          await record.save();
+        }
       }
     }
 
@@ -291,6 +345,17 @@ router.put('/:id/sign', authenticate, async (req, res, next) => {
     }
 
     if (contract.signedByTenant && contract.signedByLandlord) {
+      // Check for overlapping contracts before finalizing sign
+      const conflict = await Contract.findOne({
+        _id: { $ne: contract._id },
+        houseId: contract.houseId,
+        status: 'signed',
+        startDate: { $lte: contract.endDate },
+        endDate: { $gte: contract.startDate },
+      });
+      if (conflict) {
+        return res.status(400).json({ message: '签署失败：该房源在合同期内已有其他有效合同，时间冲突' });
+      }
       contract.status = 'signed';
     } else {
       contract.status = 'pending_sign';
@@ -336,6 +401,35 @@ router.put('/:id/sign', authenticate, async (req, res, next) => {
         await FinanceRecord.insertMany(records);
       }
     }
+
+    const populated = await Contract.findById(contract._id)
+      .populate('tenantId', 'name phone')
+      .populate('landlordId', 'name phone')
+      .populate('houseId', 'title address');
+    res.json(populated);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/contracts/:id/reject - Tenant rejects contract, resets sign status
+router.put('/:id/reject', authenticate, async (req, res, next) => {
+  try {
+    const contract = await Contract.findById(req.params.id);
+    if (!contract) {
+      return res.status(404).json({ message: '合同不存在' });
+    }
+    if (req.user._id.toString() !== contract.tenantId.toString()) {
+      return res.status(403).json({ message: '只有租户可以拒绝合同' });
+    }
+    if (contract.status !== 'pending_sign' && contract.status !== 'draft') {
+      return res.status(400).json({ message: '当前合同状态不允许拒绝' });
+    }
+
+    contract.signedByLandlord = false;
+    contract.signedByTenant = false;
+    contract.status = 'draft';
+    await contract.save();
 
     const populated = await Contract.findById(contract._id)
       .populate('tenantId', 'name phone')
